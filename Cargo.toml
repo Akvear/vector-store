@@ -15,7 +15,10 @@ license = "LicenseRef-ScyllaDB-Source-Available-1.0"
 anyhow = "1.0.97"
 aws-config = "1.8.14"
 aws-credential-types = "1.2.12"
-aws-sdk-dynamodb = { version = "1.105.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-dynamodb = { version = "1.105.0", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-smithy-runtime-api = "1.11.4"
 aws-smithy-types = "1.4.4"
 arrow-array = "56.0.0"
@@ -49,7 +52,11 @@ e2etest-scylla-proxy-cluster = "0.1.0"
 e2etest-tls = "0.1.0"
 e2etest-vector-store-cluster = "0.1.1"
 futures = "0.3.31"
-hotpath = { version = "0.15.0", features = ["tokio", "futures", "async-channel"] }
+hotpath = { version = "0.15.0", features = [
+    "tokio",
+    "futures",
+    "async-channel",
+] }
 http = "1.4.0"
 httpapi = { path = "crates/httpapi" }
 httpclient = { path = "crates/httpclient" }
@@ -63,15 +70,26 @@ ntest = "0.9.3"
 num-bigint = "0.4"
 rustls = "0.23"
 rustls-pki-types = "1.13.1"
-opensearch = { version = "2.3.0", default-features = false, features = ["rustls-tls"] }
+opensearch = { version = "2.3.0", default-features = false, features = [
+    "rustls-tls",
+] }
 parquet = { version = "56.0.0", features = ["async"] }
 prometheus = "0.14"
 quote = "1.0"
 rand = "0.10.1"
 rcgen = "0.14.5"
 regex = "1.11.1"
-reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
-scylla = { version = "1.5.0", features = ["time-03", "rustls-023", "metrics", "bigdecimal-04", "num-bigint-04"] }
+reqwest = { version = "0.12.15", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+scylla = { version = "1.5.0", features = [
+    "time-03",
+    "rustls-023",
+    "metrics",
+    "bigdecimal-04",
+    "num-bigint-04",
+] }
 scylla-cdc = "0.6.3"
 scylla-proxy = "0.0.5"
 serde = { version = "1.0.219", features = ["derive"] }
