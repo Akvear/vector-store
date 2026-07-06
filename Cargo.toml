@@ -36,6 +36,12 @@ console-subscriber = "0.5.0"
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 dashmap = "6.1.0"
 derive_more = { version = "2.0.1", features = ["full"] }
+
+diskann = "=0.54.0"
+diskann-disk = "=0.54.0"
+diskann-quantization = "=0.54.0"
+diskann-providers = "=0.54.0"
+diskann-vector = "=0.54.0"
 dotenvy = "0.15.7"
 e2etest = "0.2.0"
 e2etest-dns = "0.1.0"
