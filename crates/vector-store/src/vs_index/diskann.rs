@@ -162,3 +162,58 @@ impl TryFrom<SpaceType> for Metric {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Connectivity;
+    use crate::ExpansionAdd;
+    use crate::ExpansionSearch;
+    use crate::IndexKey;
+    use crate::IndexName;
+    use crate::KeyspaceName;
+    use crate::Quantization;
+    use std::num::NonZeroUsize;
+
+    const ALPHA: f32 = 1.2;
+    const MAX_POINTS: usize = 1_000_000;
+
+    fn test_index() -> VsIndexConfiguration {
+        VsIndexConfiguration {
+            key: IndexKey::new(
+                &KeyspaceName::from("ks".to_string()),
+                &IndexName::from("tbl".to_string()),
+            ),
+            dimensions: NonZeroUsize::new(3).unwrap().into(),
+            connectivity: Connectivity(16),
+            expansion_add: ExpansionAdd(64),
+            expansion_search: ExpansionSearch(32),
+            space_type: SpaceType::Euclidean,
+            quantization: Quantization::F32,
+        }
+    }
+
+    #[test]
+    fn diskann_metric_try_from_space_type() {
+        assert_eq!(Metric::try_from(SpaceType::Euclidean).unwrap(), Metric::L2);
+        assert_eq!(Metric::try_from(SpaceType::Cosine).unwrap(), Metric::Cosine);
+        assert_eq!(
+            Metric::try_from(SpaceType::DotProduct).unwrap(),
+            Metric::InnerProduct
+        );
+        assert!(Metric::try_from(SpaceType::Hamming).is_err());
+    }
+
+    #[test]
+    fn diskann_params_try_from_index_configuration() {
+        let params = DiskannParams::try_from((&test_index(), ALPHA, MAX_POINTS)).unwrap();
+
+        assert_eq!(
+            params.config.pruned_degree(),
+            NonZeroUsize::new(16).unwrap()
+        );
+        assert_eq!(params.dim, 3);
+        assert_eq!(params.l_search_default, NonZeroUsize::new(32).unwrap());
+        assert_eq!(params.config.l_build(), NonZeroUsize::new(64).unwrap());
+        assert_eq!(params.metric, Metric::L2);
+    }
+}
