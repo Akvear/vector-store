@@ -162,6 +162,65 @@ impl TryFrom<SpaceType> for Metric {
     }
 }
 
+/// A custom storage provider that scopes all DiskANN file operations
+/// to a specific directory on the node's local SSD.
+pub struct NodeLocalSsdProvider {
+    base_dir: PathBuf,
+}
+
+impl NodeLocalSsdProvider {
+    /// Creates a new provider. The directory should be provisioned before calling this.
+    pub fn new(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+
+    /// Helper to safely resolve the DiskANN string identifier (e.g., "index.graph")
+    /// to a physical path within the SSD directory.
+    fn get_path(&self, item_identifier: &str) -> PathBuf {
+        self.base_dir.join(item_identifier)
+    }
+}
+
+impl StorageReadProvider for NodeLocalSsdProvider {
+    type Reader = File;
+
+    fn open_reader(&self, item_identifier: &str) -> Result<Self::Reader, std::io::Error> {
+        File::open(self.get_path(item_identifier))
+    }
+
+    fn get_length(&self, item_identifier: &str) -> Result<u64, std::io::Error> {
+        let metadata = std::fs::metadata(self.get_path(item_identifier))?;
+        Ok(metadata.len())
+    }
+
+    fn exists(&self, item_identifier: &str) -> bool {
+        self.get_path(item_identifier).exists()
+    }
+}
+
+impl StorageWriteProvider for NodeLocalSsdProvider {
+    type Writer = File;
+
+    fn open_writer(&self, item_identifier: &str) -> Result<Self::Writer, std::io::Error> {
+        OpenOptions::new()
+            .write(true)
+            .open(self.get_path(item_identifier))
+    }
+
+    fn create_for_write(&self, item_identifier: &str) -> Result<Self::Writer, std::io::Error> {
+        File::create(self.get_path(item_identifier))
+    }
+
+    fn delete(&self, item_identifier: &str) -> Result<(), std::io::Error> {
+        let path = self.get_path(item_identifier);
+        if path.exists() {
+            std::fs::remove_file(path)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
