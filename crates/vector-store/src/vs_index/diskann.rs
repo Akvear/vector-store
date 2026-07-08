@@ -4,41 +4,70 @@
  */
 
 use crate::Config;
+use crate::Dimensions;
+use crate::IndexKey;
 use crate::Quantization;
 use crate::SpaceType;
 use crate::VsIndexFactory;
 use crate::memory::Memory;
 use crate::perf;
 use crate::table::Table;
+use crate::table::TableSearch;
 use crate::vs_index::actor::VsIndex;
 use crate::vs_index::factory::VsIndexConfiguration;
+
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::RwLock;
-use tokio::sync::mpsc;
-use tokio::sync::watch;
-use tracing::Instrument;
-use tracing::debug;
-use tracing::debug_span;
-use tracing::warn;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use tokio::sync::{mpsc, watch};
+use tracing::{Instrument, debug, debug_span, warn};
+
+use diskann::error::ErrorContext;
+use diskann::graph::Config as DiskannConfig;
+use diskann::graph::config::defaults::ALPHA as DISKANN_DEFAULT_ALPHA;
+use diskann::graph::config::{Builder, MaxDegree};
 use diskann::utils::ONE;
+use diskann_disk::build::builder::build::DiskIndexBuilder;
+use diskann_disk::data_model::AdHoc;
+use diskann_disk::disk_index_build_parameter::{DISK_SECTOR_LEN, MemoryBudget, NumPQChunks};
+use diskann_disk::storage::DiskIndexWriter;
+use diskann_disk::{DiskIndexBuildParameters, QuantizationType};
 use diskann_providers::model::configuration::IndexConfiguration;
+use diskann_providers::storage::{StorageReadProvider, StorageWriteProvider};
 use diskann_vector::distance::Metric;
 
 const DISKANN_VERSION: &str = "0.54.0";
-const NUM_THREADS: usize = 4;
+// TODO: wire up through config instead of hardcoding (S1-T4)
+const NUM_THREADS: usize = 1;
+const TMP_DIR: &str = "/tmp/diskann";
+const MAX_POINTS: usize = 1_000_000;
+const BUILD_MEMORY_LIMIT_GB: f64 = 2.0;
+const BUILD_PQ_CHUNKS: usize = 1;
+const SEED_DATASET_POINTS: u32 = 256;
 
-pub struct DiskannIndexFactory;
+pub struct DiskannIndexFactory {
+    diskann_index_path: PathBuf,
+    alpha: f32,
+}
 
 impl VsIndexFactory for DiskannIndexFactory {
     fn create_index(
         &self,
         index: VsIndexConfiguration,
-        _table: Arc<RwLock<Table>>,
-        _memory: mpsc::Sender<Memory>,
+        table: Arc<RwLock<Table>>,
+        memory: mpsc::Sender<Memory>,
     ) -> anyhow::Result<mpsc::Sender<VsIndex>> {
-        new(index.key)
+        let params = DiskannParams::try_from((&index, self.alpha, MAX_POINTS))?;
+        new(
+            params,
+            index.key,
+            index.dimensions,
+            &self.diskann_index_path,
+            table,
+            memory,
+        )
     }
 
     fn index_engine_version(&self) -> String {
@@ -47,12 +76,34 @@ impl VsIndexFactory for DiskannIndexFactory {
 }
 
 pub fn new_diskann(
-    _config_rx: watch::Receiver<Arc<Config>>,
+    mut config_rx: watch::Receiver<Arc<Config>>,
 ) -> anyhow::Result<DiskannIndexFactory> {
-    Ok(DiskannIndexFactory)
+    // TODO: use config to configure DiskANN index path and alpha
+    let _config = config_rx.borrow_and_update().clone();
+    Ok(DiskannIndexFactory {
+        diskann_index_path: PathBuf::from(TMP_DIR),
+        alpha: DISKANN_DEFAULT_ALPHA,
+    })
 }
 
-fn new(index_key: crate::IndexKey) -> anyhow::Result<mpsc::Sender<VsIndex>> {
+fn new(
+    params: DiskannParams,
+    index_key: IndexKey,
+    dimensions: Dimensions,
+    diskann_index_path: &Path,
+    _table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
+    _memory: mpsc::Sender<Memory>,
+) -> anyhow::Result<mpsc::Sender<VsIndex>> {
+    let index_dir = diskann_index_path.join(index_key.as_ref());
+
+    if index_dir.exists() && index_dir.read_dir()?.next().is_some() {
+        anyhow::bail!("DiskANN index directory already exists and is non-empty: {index_dir:?}");
+    }
+
+    std::fs::create_dir_all(&index_dir).context("failed to create DiskANN index directory")?;
+
+    build_seed_disk_index(params, dimensions, index_dir.clone())?;
+
     let (tx, mut rx) = mpsc::channel(perf::channel_size().into());
 
     tokio::spawn(perf::hotpath_async(
@@ -88,11 +139,115 @@ fn new(index_key: crate::IndexKey) -> anyhow::Result<mpsc::Sender<VsIndex>> {
     Ok(tx)
 }
 
+fn build_seed_disk_index(
+    params: DiskannParams,
+    dimensions: Dimensions,
+    index_dir: PathBuf,
+) -> anyhow::Result<()> {
+    std::thread::spawn(move || {
+        build_seed_disk_index_on_current_thread(params, dimensions, index_dir)
+    })
+    .join()
+    .map_err(|err| anyhow::anyhow!("DiskANN seed index build thread panicked: {err:?}"))?
+}
+
+fn build_seed_disk_index_on_current_thread(
+    params: DiskannParams,
+    dimensions: Dimensions,
+    index_dir: PathBuf,
+) -> anyhow::Result<()> {
+    let storage_provider = NodeLocalSsdProvider::new(index_dir.clone());
+
+    // TODO: make these DiskANN build constants configurable or agree on
+    // production defaults when the dedicated DiskANN configuration surface exists.
+    let disk_index_build_parameters = DiskIndexBuildParameters::new(
+        MemoryBudget::try_from_gb(BUILD_MEMORY_LIMIT_GB)
+            .context("failed to create DiskANN build memory budget")?,
+        QuantizationType::PQ {
+            num_chunks: BUILD_PQ_CHUNKS,
+        },
+        NumPQChunks::new_with(BUILD_PQ_CHUNKS, usize::from(dimensions.0))
+            .context("failed to create DiskANN PQ chunk configuration")?,
+    );
+
+    let index_configuration = IndexConfiguration::from(params);
+
+    let dataset_path = index_dir.join("dummy_dataset.bin");
+    let prefix_path = index_dir.join("index");
+
+    let dataset_file_str = dataset_path
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!("DiskANN dataset path is not valid UTF-8: {dataset_path:?}")
+        })?
+        .to_string();
+    let index_path_prefix_str = prefix_path
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!("DiskANN index prefix path is not valid UTF-8: {prefix_path:?}")
+        })?
+        .to_string();
+
+    write_seed_dataset(&dataset_path, dimensions)?;
+
+    let index_writer = DiskIndexWriter::new(
+        dataset_file_str,
+        index_path_prefix_str,
+        None, // No associated data file
+        DISK_SECTOR_LEN,
+    )
+    .context("failed to create a DiskIndexWriter")?;
+
+    let mut builder = DiskIndexBuilder::<'_, AdHoc<f32, u32>, _>::new(
+        &storage_provider,
+        disk_index_build_parameters,
+        index_configuration,
+        index_writer,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to create DiskANN index builder: {}", e))?;
+
+    builder.build().context("failed to build DiskANN index")?;
+
+    Ok(())
+}
+
+fn write_seed_dataset(dataset_path: &Path, dimensions: Dimensions) -> anyhow::Result<()> {
+    // TODO: Important
+    // DiskANN3's disk builder trains PQ during construction and cannot build from
+    // an empty dataset. Vector Store creates the index before CDC supplies real
+    // vectors, so S1-T3 materializes disk-provider files using deterministic seed
+    // vectors. This must be discussed and replaced with an agreed approach.
+    let mut dataset = File::create(dataset_path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to create DiskANN seed dataset at {:?}: {}",
+            dataset_path,
+            e
+        )
+    })?;
+    let dimensions_u32 = u32::try_from(usize::from(dimensions.0))
+        .context("DiskANN seed dataset dimensions do not fit in u32")?;
+
+    dataset.write_all(&SEED_DATASET_POINTS.to_le_bytes())?;
+    dataset.write_all(&dimensions_u32.to_le_bytes())?;
+
+    for i in 0..SEED_DATASET_POINTS {
+        for j in 0..usize::from(dimensions.0) {
+            let dummy_val: f32 = (i as f32) + (j as f32 * 0.1);
+            dataset.write_all(&dummy_val.to_le_bytes())?;
+        }
+    }
+
+    dataset.sync_all()?;
+    Ok(())
+}
+
 pub(crate) struct DiskannParams {
     pub(crate) config: DiskannConfig,
     pub(crate) metric: Metric,
     pub(crate) dim: usize,
     pub(crate) max_points: usize,
+    #[allow(dead_code)]
+    // AFAIK l_search is used per query, but we don't have queries yet, so this is unused for now
     pub(crate) l_search_default: NonZeroUsize,
 }
 
