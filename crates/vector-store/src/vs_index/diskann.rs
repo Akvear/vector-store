@@ -386,7 +386,13 @@ mod tests {
     use crate::IndexName;
     use crate::KeyspaceName;
     use crate::Quantization;
+    use crate::table::MockTableSearch;
+    use diskann_providers::storage::{
+        get_compressed_pq_file, get_disk_index_file, get_pq_pivot_file,
+    };
     use std::num::NonZeroUsize;
+    use std::path::Path;
+    use tempfile::tempdir;
 
     const ALPHA: f32 = 1.2;
     const MAX_POINTS: usize = 1_000_000;
@@ -414,7 +420,11 @@ mod tests {
             Metric::try_from(SpaceType::DotProduct).unwrap(),
             Metric::InnerProduct
         );
-        assert!(Metric::try_from(SpaceType::Hamming).is_err());
+        let err = Metric::try_from(SpaceType::Hamming).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "DiskANN does not support Hamming space type"
+        );
     }
 
     #[test]
@@ -429,5 +439,37 @@ mod tests {
         assert_eq!(params.l_search_default, NonZeroUsize::new(32).unwrap());
         assert_eq!(params.config.l_build(), NonZeroUsize::new(64).unwrap());
         assert_eq!(params.metric, Metric::L2);
+    }
+
+    #[tokio::test]
+    async fn new_materializes_disk_provider_files() {
+        let tmp_dir = tempdir().unwrap();
+        let cfg = test_index();
+        let index_key = cfg.key.clone();
+        let dimensions = cfg.dimensions;
+        let params = DiskannParams::try_from((&cfg, ALPHA, MAX_POINTS)).unwrap();
+        let table = Arc::new(RwLock::new(MockTableSearch::new()));
+        let (memory_tx, _memory_rx) = mpsc::channel(1);
+
+        let actor = new(
+            params,
+            index_key.clone(),
+            dimensions,
+            tmp_dir.path(),
+            table,
+            memory_tx,
+        )
+        .unwrap();
+
+        let index_dir = tmp_dir.path().join(index_key.as_ref());
+        let index_prefix = index_dir.join("index");
+        let index_prefix = index_prefix.to_str().unwrap();
+
+        assert!(index_dir.exists());
+        assert!(Path::new(&get_disk_index_file(index_prefix)).exists());
+        assert!(Path::new(&get_pq_pivot_file(index_prefix)).exists());
+        assert!(Path::new(&get_compressed_pq_file(index_prefix)).exists());
+
+        drop(actor);
     }
 }
