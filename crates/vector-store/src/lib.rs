@@ -167,6 +167,8 @@ pub struct Config {
     pub opensearch_addr: Option<String>,
     pub credentials: Option<Credentials>,
     pub usearch_simulator: Option<Vec<Duration>>,
+    pub diskann_index_path: Option<std::path::PathBuf>,
+    pub diskann_alpha: Option<f32>,
     pub alter_index_simulator: bool,
     pub fulltext_indexes: bool,
     pub cql_connection_timeout: Option<Duration>,
@@ -198,6 +200,8 @@ impl Default for Config {
             opensearch_addr: None,
             credentials: None,
             usearch_simulator: None,
+            diskann_index_path: None,
+            diskann_alpha: None,
             alter_index_simulator: false,
             fulltext_indexes: true,
             disable_colors: false,
@@ -765,6 +769,12 @@ pub fn new_index_factory_opensearch(
     Ok(Box::new(vs_index::opensearch::new_opensearch(
         &addr, config_rx,
     )?))
+}
+
+pub fn new_index_factory_diskann(
+    config_rx: watch::Receiver<Arc<Config>>,
+) -> anyhow::Result<Box<dyn VsIndexFactory + Send + Sync>> {
+    Ok(Box::new(vs_index::diskann::new_diskann(config_rx)?))
 }
 
 pub fn openapi() -> OpenApi {

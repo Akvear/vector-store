@@ -41,7 +41,6 @@ use diskann_vector::distance::Metric;
 const DISKANN_VERSION: &str = "0.54.0";
 // TODO: wire up through config instead of hardcoding (S1-T4)
 const NUM_THREADS: usize = 1;
-const TMP_DIR: &str = "/tmp/diskann";
 const MAX_POINTS: usize = 1_000_000;
 const BUILD_MEMORY_LIMIT_GB: f64 = 2.0;
 const BUILD_PQ_CHUNKS: usize = 1;
@@ -78,11 +77,16 @@ impl VsIndexFactory for DiskannIndexFactory {
 pub fn new_diskann(
     mut config_rx: watch::Receiver<Arc<Config>>,
 ) -> anyhow::Result<DiskannIndexFactory> {
-    // TODO: use config to configure DiskANN index path and alpha
-    let _config = config_rx.borrow_and_update().clone();
+    let config = config_rx.borrow_and_update();
+
+    let diskann_index_path = config
+        .diskann_index_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("DiskANN index path should be set"))?;
+
     Ok(DiskannIndexFactory {
-        diskann_index_path: PathBuf::from(TMP_DIR),
-        alpha: DISKANN_DEFAULT_ALPHA,
+        diskann_index_path,
+        alpha: config.diskann_alpha.unwrap_or(DISKANN_DEFAULT_ALPHA),
     })
 }
 
