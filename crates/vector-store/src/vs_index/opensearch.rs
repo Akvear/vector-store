@@ -305,6 +305,7 @@ async fn process(
         }
         VsIndex::FilteredAnn { tx, .. } => filtered_ann(tx).await,
         VsIndex::Count { tx, .. } => count(index_key, tx, client).await,
+        VsIndex::InitialScanFinished => {}
 
         _ => todo!(),
     }

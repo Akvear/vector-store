@@ -277,7 +277,7 @@ async fn add_index(
 struct AddIndexContext<'a> {
     key: IndexKey,
     table: Arc<RwLock<Table>>,
-    embeddings_stream: mpsc::Receiver<(crate::DbIndexedRow, crate::AsyncInProgress)>,
+    embeddings_stream: mpsc::Receiver<crate::DbEmbeddingEvent>,
     metrics: Arc<Metrics>,
     db_index: mpsc::Sender<DbIndex>,
     indexes: &'a RwLock<Indexes>,

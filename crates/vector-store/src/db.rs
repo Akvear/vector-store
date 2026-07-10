@@ -3,15 +3,14 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
  */
 
-use crate::AsyncInProgress;
 use crate::ColumnName;
 use crate::Config;
 use crate::Connectivity;
 use crate::Credentials;
 use crate::DbCustomIndex;
+use crate::DbEmbeddingEvent;
 use crate::DbIndexKind;
 use crate::DbIndexPartitioning;
-use crate::DbIndexedRow;
 use crate::Dimensions;
 use crate::ExpansionAdd;
 use crate::ExpansionSearch;
@@ -69,10 +68,7 @@ use tracing::trace;
 use tracing::warn;
 use uuid::Uuid;
 
-type GetDbIndexR = anyhow::Result<(
-    mpsc::Sender<DbIndex>,
-    mpsc::Receiver<(DbIndexedRow, AsyncInProgress)>,
-)>;
+type GetDbIndexR = anyhow::Result<(mpsc::Sender<DbIndex>, mpsc::Receiver<DbEmbeddingEvent>)>;
 pub(crate) type LatestSchemaVersionR = anyhow::Result<Option<CqlTimeuuid>>;
 type GetIndexesR = anyhow::Result<Vec<DbCustomIndex>>;
 type GetIndexVersionR = anyhow::Result<Option<IndexVersion>>;

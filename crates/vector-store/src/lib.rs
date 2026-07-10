@@ -84,6 +84,11 @@ use uuid::Uuid;
 pub use vector::Vector;
 pub use vs_index::factory::VsIndexFactory;
 
+pub enum DbEmbeddingEvent {
+    Row(DbIndexedRow, AsyncInProgress),
+    InitialScanFinished,
+}
+
 /// A CQL string literal that is always properly single-quoted when formatted
 /// for use in CQL statements.
 ///

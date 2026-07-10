@@ -529,6 +529,7 @@ mod operation {
                 VsIndex::RemoveVector { .. } => Mode::Remove,
                 VsIndex::Ann { .. } | VsIndex::FilteredAnn { .. } => Mode::Search,
                 VsIndex::RemovePartition { .. } => todo!(),
+                VsIndex::InitialScanFinished => unreachable!(),
                 VsIndex::Count { .. } => unreachable!(),
             }
         }
@@ -883,6 +884,8 @@ where
             };
             None
         }
+
+        VsIndex::InitialScanFinished => None,
     }
 }
 
@@ -990,6 +993,7 @@ fn process<I, T>(
         } => remove(partition, primary_id, &size),
 
         VsIndex::RemovePartition { .. } => unreachable!(),
+        VsIndex::InitialScanFinished => unreachable!(),
     }
 }
 

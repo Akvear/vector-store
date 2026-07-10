@@ -32,6 +32,7 @@ pub enum VsIndex {
     RemovePartition {
         partition_id: PartitionId,
     },
+    InitialScanFinished,
     Ann {
         index_key: IndexKey,
         embedding: Vector,
@@ -66,6 +67,7 @@ pub(crate) trait VsIndexExt {
         in_progress: AsyncInProgress,
     );
     async fn remove_partition(&self, partition_id: PartitionId);
+    async fn initial_scan_finished(&self);
     async fn ann(&self, index_key: IndexKey, embedding: Vector, limit: Limit) -> AnnR;
     async fn filtered_ann(
         &self,
@@ -115,6 +117,13 @@ impl VsIndexExt for mpsc::Sender<VsIndex> {
     #[hotpath::measure]
     async fn remove_partition(&self, partition_id: PartitionId) {
         self.send(VsIndex::RemovePartition { partition_id })
+            .await
+            .expect("internal actor should receive request");
+    }
+
+    #[hotpath::measure]
+    async fn initial_scan_finished(&self) {
+        self.send(VsIndex::InitialScanFinished)
             .await
             .expect("internal actor should receive request");
     }

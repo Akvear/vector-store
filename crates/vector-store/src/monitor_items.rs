@@ -4,6 +4,7 @@
  */
 
 use crate::AsyncInProgress;
+use crate::DbEmbeddingEvent;
 use crate::DbIndexedRow;
 use crate::DbIndexedValue;
 use crate::IndexKey;
@@ -48,6 +49,8 @@ pub(crate) trait IndexDispatch {
     ) -> impl Future<Output = ()> + Send;
 
     fn remove_partition(&self, partition_id: PartitionId) -> impl Future<Output = ()> + Send;
+
+    fn initial_scan_finished(&self) -> impl Future<Output = ()> + Send;
 }
 
 impl IndexDispatch for mpsc::Sender<VsIndex> {
@@ -82,6 +85,10 @@ impl IndexDispatch for mpsc::Sender<VsIndex> {
     async fn remove_partition(&self, partition_id: PartitionId) {
         VsIndexExt::remove_partition(self, partition_id).await;
     }
+
+    async fn initial_scan_finished(&self) {
+        VsIndexExt::initial_scan_finished(self).await;
+    }
 }
 
 impl IndexDispatch for mpsc::Sender<FtsIndex> {
@@ -112,6 +119,8 @@ impl IndexDispatch for mpsc::Sender<FtsIndex> {
     }
 
     async fn remove_partition(&self, _partition_id: PartitionId) {}
+
+    async fn initial_scan_finished(&self) {}
 }
 
 pub(crate) enum MonitorItems {}
@@ -119,7 +128,7 @@ pub(crate) enum MonitorItems {}
 pub(crate) async fn new<T>(
     key: IndexKey,
     table: Arc<RwLock<impl TableAdd + Send + Sync + 'static>>,
-    mut embeddings: Receiver<(DbIndexedRow, AsyncInProgress)>,
+    mut embeddings: Receiver<DbEmbeddingEvent>,
     index: mpsc::Sender<T>,
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<Sender<MonitorItems>>
@@ -137,10 +146,17 @@ where
             while !rx.is_closed() {
                 tokio::select! {
                     embedding = embeddings.recv() => {
-                        let Some((embedding, in_progress)) = embedding else {
+                        let Some(embedding) = embedding else {
                             break;
                         };
-                        add(&table, &index, embedding, in_progress, &metrics, &key).await;
+                        match embedding {
+                            DbEmbeddingEvent::Row(embedding, in_progress) => {
+                                add(&table, &index, embedding, in_progress, &metrics, &key).await;
+                            }
+                            DbEmbeddingEvent::InitialScanFinished => {
+                                index.initial_scan_finished().await;
+                            }
+                        }
                     }
                     _ = rx.recv() => { }
                 }

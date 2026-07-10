@@ -5,18 +5,26 @@
 
 use crate::Config;
 use crate::Dimensions;
+use crate::Distance;
 use crate::IndexKey;
+use crate::Limit;
+use crate::PrimaryKey;
 use crate::Quantization;
 use crate::SpaceType;
+use crate::Vector;
 use crate::VsIndexFactory;
 use crate::memory::Memory;
 use crate::perf;
+use crate::table::PartitionId;
+use crate::table::PrimaryId;
 use crate::table::Table;
 use crate::table::TableSearch;
 use crate::vs_index::actor::VsIndex;
 use crate::vs_index::factory::VsIndexConfiguration;
 
 use std::fs::{File, OpenOptions};
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -31,8 +39,13 @@ use diskann::graph::config::{Builder, MaxDegree};
 use diskann::utils::ONE;
 use diskann_disk::build::builder::build::DiskIndexBuilder;
 use diskann_disk::data_model::AdHoc;
+use diskann_disk::data_model::CachingStrategy;
 use diskann_disk::disk_index_build_parameter::{DISK_SECTOR_LEN, MemoryBudget, NumPQChunks};
+use diskann_disk::search::provider::disk_provider::DiskIndexSearcher;
+use diskann_disk::search::provider::disk_vertex_provider_factory::DiskVertexProviderFactory;
 use diskann_disk::storage::DiskIndexWriter;
+use diskann_disk::storage::disk_index_reader::DiskIndexReader;
+use diskann_disk::utils::aligned_file_reader::AlignedFileReaderFactory;
 use diskann_disk::{DiskIndexBuildParameters, QuantizationType};
 use diskann_providers::model::configuration::IndexConfiguration;
 use diskann_providers::storage::{StorageReadProvider, StorageWriteProvider};
@@ -44,7 +57,8 @@ const NUM_THREADS: usize = 1;
 const MAX_POINTS: usize = 1_000_000;
 const BUILD_MEMORY_LIMIT_GB: f64 = 2.0;
 const BUILD_PQ_CHUNKS: usize = 1;
-const SEED_DATASET_POINTS: u32 = 256;
+const MIN_BUILD_POINTS: usize = 1_000;
+const SEARCH_IO_LIMIT: usize = 64;
 
 pub struct DiskannIndexFactory {
     diskann_index_path: PathBuf,
@@ -95,7 +109,7 @@ fn new(
     index_key: IndexKey,
     dimensions: Dimensions,
     diskann_index_path: &Path,
-    _table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
+    table: Arc<RwLock<impl TableSearch + Send + Sync + 'static>>,
     _memory: mpsc::Sender<Memory>,
 ) -> anyhow::Result<mpsc::Sender<VsIndex>> {
     let index_dir = diskann_index_path.join(index_key.as_ref());
@@ -106,32 +120,25 @@ fn new(
 
     std::fs::create_dir_all(&index_dir).context("failed to create DiskANN index directory")?;
 
-    build_seed_disk_index(params, dimensions, index_dir.clone())?;
+    let collector = InitialBuildCollector::new(&index_dir, dimensions)?;
 
     let (tx, mut rx) = mpsc::channel(perf::channel_size().into());
 
     tokio::spawn(perf::hotpath_async(
         {
-            let _index_key = index_key.clone();
             async move {
                 debug!("starting");
+                let mut state = DiskannActorState::Collecting(collector);
 
                 while let Some(msg) = rx.recv().await {
-                    match msg {
-                        VsIndex::AddVector { .. }
-                        | VsIndex::RemoveVector { .. }
-                        | VsIndex::RemovePartition { .. } => {
-                            warn!("not implemented yet");
-                        }
-                        VsIndex::Ann { tx, .. } | VsIndex::FilteredAnn { tx, .. } => {
-                            _ = tx
-                                .send(Err(anyhow::anyhow!("DiskANN index is not implemented yet")));
-                        }
-                        VsIndex::Count { tx, .. } => {
-                            _ = tx
-                                .send(Err(anyhow::anyhow!("DiskANN index is not implemented yet")));
-                        }
-                    }
+                    state = process_diskann_message(
+                        state,
+                        msg,
+                        &params,
+                        dimensions,
+                        index_dir.clone(),
+                        &table,
+                    );
                 }
 
                 debug!("finished");
@@ -143,23 +150,283 @@ fn new(
     Ok(tx)
 }
 
-fn build_seed_disk_index(
-    params: DiskannParams,
-    dimensions: Dimensions,
-    index_dir: PathBuf,
-) -> anyhow::Result<()> {
-    std::thread::spawn(move || {
-        build_seed_disk_index_on_current_thread(params, dimensions, index_dir)
-    })
-    .join()
-    .map_err(|err| anyhow::anyhow!("DiskANN seed index build thread panicked: {err:?}"))?
+enum DiskannActorState {
+    Collecting(InitialBuildCollector),
+    Serving(DiskannServingIndex),
+    Failed(String),
 }
 
-fn build_seed_disk_index_on_current_thread(
+struct InitialBuildCollector {
+    dataset: File,
+    dataset_path: PathBuf,
+    ids: Vec<(PartitionId, PrimaryId)>,
+}
+
+impl InitialBuildCollector {
+    fn new(index_dir: &Path, dimensions: Dimensions) -> anyhow::Result<Self> {
+        let dataset_path = index_dir.join("dataset.bin");
+        let mut dataset = File::create(&dataset_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to create DiskANN dataset at {:?}: {}",
+                dataset_path,
+                e
+            )
+        })?;
+        let dimensions_u32 = u32::try_from(usize::from(dimensions.0))
+            .context("DiskANN dataset dimensions do not fit in u32")?;
+
+        dataset.write_all(&0u32.to_le_bytes())?;
+        dataset.write_all(&dimensions_u32.to_le_bytes())?;
+
+        Ok(Self {
+            dataset,
+            dataset_path,
+            ids: Vec::new(),
+        })
+    }
+
+    fn add(
+        &mut self,
+        partition_id: PartitionId,
+        primary_id: PrimaryId,
+        embedding: &Vector,
+        dimensions: Dimensions,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            embedding.dim() == Some(dimensions),
+            "DiskANN vector dimensions mismatch: expected {}, got {}",
+            usize::from(dimensions.0),
+            embedding.len()
+        );
+        self.ids.push((partition_id, primary_id));
+        for value in embedding.as_slice() {
+            self.dataset.write_all(&value.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, _partition_id: PartitionId, _primary_id: PrimaryId) {
+        warn!("DiskANN remove during initial build is not implemented yet");
+    }
+
+    fn remove_partition(&mut self, _partition_id: PartitionId) {
+        warn!("DiskANN remove partition during initial build is not implemented yet");
+    }
+
+    fn finish(mut self) -> anyhow::Result<FinishedDataset> {
+        let count = u32::try_from(self.ids.len())
+            .context("DiskANN dataset point count does not fit in u32")?;
+        self.dataset.seek(SeekFrom::Start(0))?;
+        self.dataset.write_all(&count.to_le_bytes())?;
+        self.dataset.sync_all()?;
+
+        Ok(FinishedDataset {
+            dataset_path: self.dataset_path,
+            ids: self.ids,
+        })
+    }
+}
+
+struct FinishedDataset {
+    dataset_path: PathBuf,
+    ids: Vec<(PartitionId, PrimaryId)>,
+}
+
+struct DiskannServingIndex {
+    searcher: DiskIndexSearcher<AdHoc<f32, u32>>,
+    ids: Vec<(PartitionId, PrimaryId)>,
+    space_type: SpaceType,
+    l_search_default: NonZeroUsize,
+}
+
+fn process_serving_message<T: TableSearch>(
+    serving: &mut DiskannServingIndex,
+    msg: VsIndex,
+    dimensions: Dimensions,
+    table: &Arc<RwLock<T>>,
+) {
+    match msg {
+        VsIndex::Ann {
+            embedding,
+            limit,
+            tx,
+            ..
+        } => {
+            let result = ann(serving, embedding, limit, dimensions, table);
+            _ = tx.send(result);
+        }
+        VsIndex::FilteredAnn { tx, .. } => {
+            _ = tx.send(Err(anyhow::anyhow!(
+                "DiskANN filtered ANN is not implemented yet"
+            )));
+        }
+        VsIndex::Count { tx, .. } => {
+            _ = tx.send(Ok(serving.ids.len()));
+        }
+        VsIndex::AddVector { .. }
+        | VsIndex::RemoveVector { .. }
+        | VsIndex::RemovePartition { .. } => {
+            warn!("DiskANN streaming updates are not implemented yet");
+        }
+        VsIndex::InitialScanFinished => {}
+    }
+}
+
+fn ann<T: TableSearch>(
+    serving: &DiskannServingIndex,
+    embedding: Vector,
+    limit: Limit,
+    dimensions: Dimensions,
+    table: &Arc<RwLock<T>>,
+) -> anyhow::Result<(Vec<PrimaryKey>, Vec<Distance>)> {
+    anyhow::ensure!(
+        embedding.dim() == Some(dimensions),
+        "DiskANN query dimensions mismatch: expected {}, got {}",
+        usize::from(dimensions.0),
+        embedding.len()
+    );
+
+    let search = serving
+        .searcher
+        .search(
+            embedding.as_slice(),
+            limit.0.get() as u32,
+            serving.l_search_default.get() as u32,
+            None,
+            None,
+            false,
+        )
+        .context("DiskANN search failed")?;
+
+    let table = table.read().unwrap();
+    let mut primary_keys = Vec::with_capacity(search.results.len());
+    let mut distances = Vec::with_capacity(search.results.len());
+    for item in search.results {
+        let Some((partition_id, primary_id)) = serving.ids.get(item.vertex_id as usize).copied()
+        else {
+            continue;
+        };
+        let Some(primary_key) = table.primary_key(partition_id, primary_id) else {
+            continue;
+        };
+        let distance = Distance::try_from((item.distance, serving.space_type, Some(dimensions)))?;
+        primary_keys.push(primary_key);
+        distances.push(distance);
+    }
+
+    Ok((primary_keys, distances))
+}
+
+fn send_failed_response(error: &str, msg: VsIndex) {
+    match msg {
+        VsIndex::Ann { tx, .. } | VsIndex::FilteredAnn { tx, .. } => {
+            _ = tx.send(Err(anyhow::anyhow!(
+                "DiskANN index failed to build: {error}"
+            )));
+        }
+        VsIndex::Count { tx, .. } => {
+            _ = tx.send(Err(anyhow::anyhow!(
+                "DiskANN index failed to build: {error}"
+            )));
+        }
+        VsIndex::AddVector { .. }
+        | VsIndex::RemoveVector { .. }
+        | VsIndex::RemovePartition { .. }
+        | VsIndex::InitialScanFinished => {}
+    }
+}
+
+fn process_diskann_message<T: TableSearch>(
+    state: DiskannActorState,
+    msg: VsIndex,
+    params: &DiskannParams,
+    dimensions: Dimensions,
+    index_dir: PathBuf,
+    table: &Arc<RwLock<T>>,
+) -> DiskannActorState {
+    match state {
+        DiskannActorState::Collecting(mut collector) => match msg {
+            VsIndex::AddVector {
+                partition_id,
+                primary_id,
+                embedding,
+                in_progress: _in_progress,
+            } => {
+                if let Err(err) = collector.add(partition_id, primary_id, &embedding, dimensions) {
+                    return DiskannActorState::Failed(err.to_string());
+                }
+                DiskannActorState::Collecting(collector)
+            }
+            VsIndex::RemoveVector {
+                partition_id,
+                primary_id,
+                in_progress: _in_progress,
+            } => {
+                collector.remove(partition_id, primary_id);
+                DiskannActorState::Collecting(collector)
+            }
+            VsIndex::RemovePartition { partition_id } => {
+                collector.remove_partition(partition_id);
+                DiskannActorState::Collecting(collector)
+            }
+            VsIndex::InitialScanFinished => match collector.finish() {
+                Ok(dataset) => {
+                    match build_disk_index(params.clone(), dimensions, index_dir, dataset) {
+                        Ok(serving) => DiskannActorState::Serving(serving),
+                        Err(err) => DiskannActorState::Failed(err.to_string()),
+                    }
+                }
+                Err(err) => DiskannActorState::Failed(err.to_string()),
+            },
+            VsIndex::Ann { tx, .. } | VsIndex::FilteredAnn { tx, .. } => {
+                _ = tx.send(Err(anyhow::anyhow!(
+                    "DiskANN index is still bootstrapping from full scan"
+                )));
+                DiskannActorState::Collecting(collector)
+            }
+            VsIndex::Count { tx, .. } => {
+                _ = tx.send(Ok(collector.ids.len()));
+                DiskannActorState::Collecting(collector)
+            }
+        },
+        DiskannActorState::Serving(mut serving) => {
+            process_serving_message(&mut serving, msg, dimensions, table);
+            DiskannActorState::Serving(serving)
+        }
+        DiskannActorState::Failed(error) => {
+            send_failed_response(&error, msg);
+            DiskannActorState::Failed(error)
+        }
+    }
+}
+
+fn build_disk_index(
     params: DiskannParams,
     dimensions: Dimensions,
     index_dir: PathBuf,
-) -> anyhow::Result<()> {
+    dataset: FinishedDataset,
+) -> anyhow::Result<DiskannServingIndex> {
+    anyhow::ensure!(
+        dataset.ids.len() >= MIN_BUILD_POINTS,
+        "DiskANN requires at least {MIN_BUILD_POINTS} vectors to build; got {}",
+        dataset.ids.len()
+    );
+
+    let serving = std::thread::spawn(move || {
+        build_disk_index_on_current_thread(params, dimensions, index_dir, dataset)
+    })
+    .join()
+    .map_err(|err| anyhow::anyhow!("DiskANN index build thread panicked: {err:?}"))??;
+
+    Ok(serving)
+}
+
+fn build_disk_index_on_current_thread(
+    params: DiskannParams,
+    dimensions: Dimensions,
+    index_dir: PathBuf,
+    dataset: FinishedDataset,
+) -> anyhow::Result<DiskannServingIndex> {
     let storage_provider = NodeLocalSsdProvider::new(index_dir.clone());
 
     // TODO: make these DiskANN build constants configurable or agree on
@@ -174,9 +441,12 @@ fn build_seed_disk_index_on_current_thread(
             .context("failed to create DiskANN PQ chunk configuration")?,
     );
 
+    let metric = params.metric;
+    let space_type = params.space_type;
+    let l_search_default = params.l_search_default;
     let index_configuration = IndexConfiguration::from(params);
 
-    let dataset_path = index_dir.join("dummy_dataset.bin");
+    let dataset_path = dataset.dataset_path;
     let prefix_path = index_dir.join("index");
 
     let dataset_file_str = dataset_path
@@ -192,8 +462,6 @@ fn build_seed_disk_index_on_current_thread(
         })?
         .to_string();
 
-    write_seed_dataset(&dataset_path, dimensions)?;
-
     let index_writer = DiskIndexWriter::new(
         dataset_file_str,
         index_path_prefix_str,
@@ -201,6 +469,10 @@ fn build_seed_disk_index_on_current_thread(
         DISK_SECTOR_LEN,
     )
     .context("failed to create a DiskIndexWriter")?;
+
+    let disk_index_pq_pivot_file = index_writer.get_disk_index_pq_pivot_file();
+    let disk_index_compressed_pq_file = index_writer.get_disk_index_compressed_pq_file();
+    let disk_index_file = index_writer.disk_index_file();
 
     let mut builder = DiskIndexBuilder::<'_, AdHoc<f32, u32>, _>::new(
         &storage_provider,
@@ -212,42 +484,45 @@ fn build_seed_disk_index_on_current_thread(
 
     builder.build().context("failed to build DiskANN index")?;
 
-    Ok(())
+    let disk_index_reader = DiskIndexReader::new(
+        disk_index_pq_pivot_file,
+        disk_index_compressed_pq_file,
+        &storage_provider,
+    )
+    .context("failed to create DiskANN disk index reader")?;
+    let disk_index_path = index_dir.join(disk_index_file);
+    let disk_index_path = disk_index_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("DiskANN disk index path is not valid UTF-8"))?
+        .to_string();
+    let vertex_provider_factory = DiskVertexProviderFactory {
+        aligned_reader_factory: AlignedFileReaderFactory::new(disk_index_path),
+        caching_strategy: CachingStrategy::None,
+        cache: None,
+    };
+    let searcher = DiskIndexSearcher::new(
+        NUM_THREADS,
+        SEARCH_IO_LIMIT,
+        &disk_index_reader,
+        vertex_provider_factory,
+        metric,
+        None,
+    )
+    .context("failed to open built DiskANN index")?;
+
+    Ok(DiskannServingIndex {
+        searcher,
+        ids: dataset.ids,
+        space_type,
+        l_search_default,
+    })
 }
 
-fn write_seed_dataset(dataset_path: &Path, dimensions: Dimensions) -> anyhow::Result<()> {
-    // TODO: Important
-    // DiskANN3's disk builder trains PQ during construction and cannot build from
-    // an empty dataset. Vector Store creates the index before CDC supplies real
-    // vectors, so S1-T3 materializes disk-provider files using deterministic seed
-    // vectors. This must be discussed and replaced with an agreed approach.
-    let mut dataset = File::create(dataset_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to create DiskANN seed dataset at {:?}: {}",
-            dataset_path,
-            e
-        )
-    })?;
-    let dimensions_u32 = u32::try_from(usize::from(dimensions.0))
-        .context("DiskANN seed dataset dimensions do not fit in u32")?;
-
-    dataset.write_all(&SEED_DATASET_POINTS.to_le_bytes())?;
-    dataset.write_all(&dimensions_u32.to_le_bytes())?;
-
-    for i in 0..SEED_DATASET_POINTS {
-        for j in 0..usize::from(dimensions.0) {
-            let dummy_val: f32 = (i as f32) + (j as f32 * 0.1);
-            dataset.write_all(&dummy_val.to_le_bytes())?;
-        }
-    }
-
-    dataset.sync_all()?;
-    Ok(())
-}
-
+#[derive(Clone)]
 pub(crate) struct DiskannParams {
     pub(crate) config: DiskannConfig,
     pub(crate) metric: Metric,
+    pub(crate) space_type: SpaceType,
     pub(crate) dim: usize,
     pub(crate) max_points: usize,
     #[allow(dead_code)]
@@ -285,6 +560,7 @@ impl TryFrom<(&VsIndexConfiguration, f32, usize)> for DiskannParams {
         Ok(Self {
             config,
             metric,
+            space_type: cfg.space_type,
             dim: usize::from(cfg.dimensions.0),
             max_points,
             l_search_default: NonZeroUsize::new(cfg.expansion_search.0)
