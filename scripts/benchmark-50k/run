@@ -1,0 +1,106 @@
+#!/bin/bash
+
+# Run the 50k correctness benchmark: a single ScyllaDB docker node plus the
+# locally built vector-store binary running on the host.
+#
+# Follows the methodology of the published 10M/1B benchmarks scaled down to
+# the 50k dataset: a serial pass for recall@10/recall@100 against exact-KNN
+# ground truth, then a concurrency ramp for QPS/latency.
+
+set -e -o pipefail
+
+usage() {
+    echo "usage: $0 --data-dir <dataset-dir> [--engine usearch|diskann] [--options <cql-index-options>] [--results <file>]"
+    echo
+    echo "Requires host-built release binaries:"
+    echo "  cargo build -r --bin vector-store && cargo build -r -p vector-search-benchmark"
+    exit 1
+}
+
+engine=diskann
+options="{'similarity_function': 'cosine', 'maximum_node_connections': 16, 'construction_beam_width': 128, 'search_beam_width': 64}"
+data_dir=
+results=
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --data-dir) data_dir=$2; shift 2 ;;
+        --engine) engine=$2; shift 2 ;;
+        --options) options=$2; shift 2 ;;
+        --results) results=$2; shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+[[ -d $data_dir ]] || usage
+[[ $engine == usearch || $engine == diskann ]] || usage
+
+repo=$(dirname "${BASH_SOURCE[0]}")
+repo=$(realpath $repo/../..)
+vector_store_bin=$repo/target/release/vector-store
+vsb=$repo/target/release/vector-search-benchmark
+[[ -x $vector_store_bin && -x $vsb ]] || usage
+
+[[ -n $results ]] || results=benchmark-50k-$engine-$(date +%Y%m%d-%H%M%S).log
+results=$(realpath $results)
+
+scylla_image=${SCYLLA_IMAGE:-scylladb/scylla:2026.2.2}
+scylla=127.0.0.1:9042
+vector_store=127.0.0.1:6080
+
+use_diskann=false
+[[ $engine == diskann ]] && use_diskann=true
+
+vector_store_pid=
+teardown() {
+    [[ -n $vector_store_pid ]] && kill $vector_store_pid 2> /dev/null || true
+    docker rm -f benchmark-50k-scylla > /dev/null 2>&1 || true
+}
+trap teardown EXIT
+
+run() {
+    echo "### $*" | tee -a $results
+    "$@" 2>&1 | tee -a $results
+}
+
+echo "### engine: $engine" | tee $results
+echo "### options: $options" | tee -a $results
+
+echo "Starting scylla ($scylla_image)"
+docker run --rm -d --name benchmark-50k-scylla --network host $scylla_image \
+    --smp 2 --memory 2G --overprovisioned 1 \
+    --listen-address 127.0.0.1 --rpc-address 127.0.0.1 --api-address 127.0.0.1 \
+    --vector-store-primary-uri http://$vector_store > /dev/null
+timeout 180 bash -c 'until docker exec benchmark-50k-scylla cqlsh 127.0.0.1 -e "SELECT now() FROM system.local" > /dev/null 2>&1; do sleep 2; done'
+
+echo "Starting vector-store (VECTOR_STORE_USE_DISKANN=$use_diskann)"
+VECTOR_STORE_URI=$vector_store \
+VECTOR_STORE_SCYLLADB_URI=$scylla \
+VECTOR_STORE_USE_DISKANN=$use_diskann \
+    $vector_store_bin > ${results%.log}-vector-store.log 2>&1 &
+vector_store_pid=$!
+timeout 60 bash -c "until curl -sf http://$vector_store/api/v1/info > /dev/null; do sleep 1; done"
+run curl -sf http://$vector_store/api/v1/info
+echo | tee -a $results
+
+run $vsb build-table --data-dir $data_dir --scylla $scylla --rf 1 --concurrency 512
+run $vsb build-index --scylla $scylla --vector-store $vector_store --options "$options"
+
+# Serial recall passes - the correctness-gate numbers
+run $vsb search-cql --data-dir $data_dir --scylla $scylla --limit 10 --concurrency 1 --duration ${SERIAL_DURATION:-60s}
+run $vsb search-cql --data-dir $data_dir --scylla $scylla --limit 100 --concurrency 1 --duration ${SERIAL_DURATION:-60s}
+
+# Concurrency ramp over CQL - QPS & latency
+for c in ${CQL_RAMP:-1 2 4 8 16 32 64 128 150}; do
+    run $vsb search-cql --data-dir $data_dir --scylla $scylla --limit 10 --concurrency $c --duration ${RAMP_DURATION:-30s}
+done
+
+# Concurrency ramp over HTTP - vector-store only, no CQL coordinator
+for c in ${HTTP_RAMP:-1 8 32 128}; do
+    run $vsb search-http --data-dir $data_dir --vector-store $vector_store --limit 10 --concurrency $c --duration ${RAMP_DURATION:-30s}
+done
+
+run $vsb drop-index --scylla $scylla
+run $vsb drop-table --scylla $scylla
+
+echo "Results written to $results"
