@@ -38,14 +38,15 @@ use diskann::graph::InplaceDeleteMethod;
 use diskann::graph::config::Builder;
 use diskann::graph::config::MaxDegree;
 use diskann::graph::config::defaults::ALPHA as DISKANN_DEFAULT_ALPHA;
+use diskann::graph::glue::DefaultPostProcessor;
+use diskann::graph::glue::InplaceDeleteStrategy;
+use diskann::graph::glue::InsertStrategy;
 use diskann::graph::index::SearchStats;
 use diskann::graph::search::Knn;
 use diskann::neighbor::Neighbor;
-use diskann_inmem::Context as InmemContext;
-use diskann_inmem::Provider as InmemProvider;
-use diskann_inmem::Strategy as InmemStrategy;
-use diskann_inmem::layers::Full;
-use diskann_inmem::provider::Config as InmemProviderConfig;
+use diskann::provider::DataProvider;
+use diskann::provider::Delete;
+use diskann::provider::SetElement;
 use diskann_vector::distance::Metric;
 use itertools::Itertools;
 use std::collections::BTreeMap;
@@ -65,11 +66,35 @@ use tracing::error;
 use tracing::trace;
 use tracing::warn;
 
+mod inmem;
+
 const DISKANN_DEFAULT_MAX_POINTS: NonZeroUsize = NonZeroUsize::new(1_000_000).unwrap();
 
-type DiskannProvider = InmemProvider<Full<f32>, PrimaryId>;
+/// A DiskANN index backend: a data provider together with the strategy and
+/// context driving it. The trait bounds spell out everything the actor needs
+/// to insert into, delete from, and search a [`DiskANNIndex`] built over the
+/// backend's provider.
+trait DiskannBackend: Send + Sync + Clone + 'static
+where
+    Self::Provider: for<'a> SetElement<&'a [f32]> + Delete,
+    Self::Strategy: for<'a> InsertStrategy<'a, Self::Provider, &'a [f32]>
+        + for<'a> DefaultPostProcessor<'a, Self::Provider, &'a [f32], PrimaryId>
+        + InplaceDeleteStrategy<Self::Provider>
+        + Clone,
+{
+    type Provider: DataProvider<ExternalId = PrimaryId>;
+    type Strategy;
 
-type DiskannIndex = DiskANNIndex<DiskannProvider>;
+    fn create_index(
+        &self,
+        params: &DiskannParams,
+        start_point: &[f32],
+    ) -> anyhow::Result<DiskANNIndex<Self::Provider>>;
+
+    fn strategy(&self) -> &Self::Strategy;
+
+    fn context(&self) -> &<Self::Provider as DataProvider>::Context;
+}
 
 pub struct DiskannIndexFactory {
     worker: async_channel::Sender<Worker>,
@@ -88,6 +113,7 @@ impl VsIndexFactory for DiskannIndexFactory {
             .context("failed to create DiskANN parameters")?;
 
         new(
+            inmem::InmemBackend::new(),
             index.key,
             self.worker.clone(),
             self.memory.clone(),
@@ -120,7 +146,8 @@ pub fn new_diskann(
     })
 }
 
-fn new(
+fn new<DP: DiskannBackend>(
+    backend: DP,
     index_key: IndexKey,
     worker: async_channel::Sender<Worker>,
     memory: mpsc::Sender<Memory>,
@@ -150,13 +177,27 @@ fn new(
                         continue;
                     }
 
-                    let Some((partition, size, msg)) =
-                        preprocess(&mut partitions, &mut sizes, table.as_ref(), &params, msg)
-                    else {
+                    let Some((partition, size, msg)) = preprocess(
+                        backend.clone(),
+                        &mut partitions,
+                        &mut sizes,
+                        table.as_ref(),
+                        &params,
+                        msg,
+                    ) else {
                         continue;
                     };
 
-                    dispatch_task(partition, &table, &params, &worker, size, msg).await;
+                    dispatch_task(
+                        backend.clone(),
+                        partition,
+                        &table,
+                        &params,
+                        &worker,
+                        size,
+                        msg,
+                    )
+                    .await;
                 }
 
                 debug!("finished");
@@ -169,15 +210,17 @@ fn new(
 }
 
 #[hotpath::measure]
-fn preprocess<T>(
-    partitions: &mut BTreeMap<PartitionId, Arc<Partition>>,
+fn preprocess<T, DB>(
+    backend: DB,
+    partitions: &mut BTreeMap<PartitionId, Arc<Partition<DB>>>,
     sizes: &mut BTreeMap<IndexId, Arc<AtomicUsize>>,
     table: &RwLock<T>,
     params: &DiskannParams,
     msg: Message,
-) -> Option<(Arc<Partition>, Arc<AtomicUsize>, Message)>
+) -> Option<(Arc<Partition<DB>>, Arc<AtomicUsize>, Message)>
 where
     T: TableSearch + Send + Sync + 'static,
+    DB: DiskannBackend,
 {
     match msg {
         Message::Modify(VsIndexModify::AddVector {
@@ -190,7 +233,8 @@ where
                 Entry::Vacant(entry) => {
                     // The first vector of a partition becomes the start point of the graph, so the
                     // index is created here to make it depend on the order of the messages only.
-                    let index = create_diskann_index(params, Some(embedding.as_slice()))
+                    let index = backend
+                        .create_index(params, embedding.as_slice())
                         .context(format!(
                             "failed to create index for partition {partition_id:?}"
                         ))
@@ -275,8 +319,9 @@ where
 }
 
 #[hotpath::measure]
-async fn dispatch_task<T>(
-    partition: Arc<Partition>,
+async fn dispatch_task<T, DB>(
+    backend: DB,
+    partition: Arc<Partition<DB>>,
     table: &Arc<RwLock<T>>,
     params: &Arc<DiskannParams>,
     worker: &async_channel::Sender<Worker>,
@@ -284,11 +329,12 @@ async fn dispatch_task<T>(
     msg: Message,
 ) where
     T: TableSearch + Send + Sync + 'static,
+    DB: DiskannBackend,
 {
     let non_blocking = is_non_blocking(&msg);
     let table = Arc::clone(table);
     let params = Arc::clone(params);
-    let task = move || process(partition, table, params, size, msg);
+    let task = move || process(backend, partition, table, params, size, msg);
     if non_blocking {
         worker.spawn_async_non_blocking(task).await;
     } else {
@@ -302,14 +348,16 @@ fn is_non_blocking(msg: &Message) -> bool {
 }
 
 #[hotpath::measure]
-async fn process<T>(
-    partition: Arc<Partition>,
+async fn process<T, DB>(
+    backend: DB,
+    partition: Arc<Partition<DB>>,
     table: Arc<RwLock<T>>,
     params: Arc<DiskannParams>,
     size: Arc<AtomicUsize>,
     msg: Message,
 ) where
     T: TableSearch + Send + Sync + 'static,
+    DB: DiskannBackend,
 {
     match msg {
         Message::Modify(VsIndexModify::AddVector {
@@ -317,13 +365,13 @@ async fn process<T>(
             embedding,
             in_progress: _in_progress,
             ..
-        }) => add_vector(&partition, &size, primary_id, embedding).await,
+        }) => add_vector(backend, &partition, &size, primary_id, embedding).await,
 
         Message::Modify(VsIndexModify::RemoveVector {
             primary_id,
             in_progress: _in_progress,
             ..
-        }) => remove_vector(&partition, &params, &size, primary_id).await,
+        }) => remove_vector(backend, &partition, &params, &size, primary_id).await,
 
         Message::Search(VsIndexSearch::Ann {
             embedding,
@@ -332,7 +380,7 @@ async fn process<T>(
             ..
         }) => {
             if let Some(tx) = validate_dimensions(tx, &embedding, params.dim) {
-                _ = tx.send(ann(&partition, &table, &params, embedding, limit).await);
+                _ = tx.send(ann(backend, &partition, &table, &params, embedding, limit).await);
             }
         }
 
@@ -344,28 +392,14 @@ async fn process<T>(
     }
 }
 
-fn create_diskann_index(
-    params: &DiskannParams,
-    start_point: Option<&[f32]>,
-) -> anyhow::Result<DiskannIndex> {
-    let layer = Full::<f32>::new(usize::from(params.dim.0), params.metric);
-    let cfg = InmemProviderConfig::new(
-        usize::from(params.max_points),
-        params.config.max_degree().get(),
-    );
-    let start_points: Vec<&[f32]> = start_point.into_iter().collect();
-    let provider = InmemProvider::<_, PrimaryId>::new(layer, cfg, start_points)
-        .context("failed to create InmemProvider")?;
-    Ok(DiskANNIndex::new(params.config.clone(), provider, None))
-}
-
-struct Partition {
+struct Partition<DB: DiskannBackend> {
     partition_id: PartitionId,
-    index: DiskannIndex,
+    index: DiskANNIndex<DB::Provider>,
 }
 
-async fn add_vector(
-    partition: &Partition,
+async fn add_vector<DB: DiskannBackend>(
+    backend: DB,
+    partition: &Partition<DB>,
     size: &AtomicUsize,
     primary_id: PrimaryId,
     embedding: Vector,
@@ -373,8 +407,8 @@ async fn add_vector(
     if let Err(err) = partition
         .index
         .insert(
-            &InmemStrategy,
-            &InmemContext,
+            backend.strategy(),
+            backend.context(),
             &primary_id,
             embedding.as_slice(),
         )
@@ -386,8 +420,9 @@ async fn add_vector(
     }
 }
 
-async fn remove_vector(
-    partition: &Partition,
+async fn remove_vector<DB: DiskannBackend>(
+    backend: DB,
+    partition: &Partition<DB>,
     params: &DiskannParams,
     size: &AtomicUsize,
     primary_id: PrimaryId,
@@ -395,8 +430,8 @@ async fn remove_vector(
     if let Err(err) = partition
         .index
         .inplace_delete(
-            InmemStrategy,
-            &InmemContext,
+            backend.strategy().clone(),
+            backend.context(),
             &primary_id,
             params.config.pruned_degree().get(),
             InplaceDeleteMethod::OneHop,
@@ -409,8 +444,9 @@ async fn remove_vector(
     }
 }
 
-async fn search(
-    partition: &Partition,
+async fn search<DB: DiskannBackend>(
+    backend: DB,
+    partition: &Partition<DB>,
     params: &DiskannParams,
     embedding: &Vector,
     k: usize,
@@ -428,8 +464,8 @@ async fn search(
         .index
         .search(
             knn,
-            &InmemStrategy,
-            &InmemContext,
+            backend.strategy(),
+            backend.context(),
             embedding.as_slice(),
             &mut neighbors,
         )
@@ -446,8 +482,9 @@ async fn search(
     }))
 }
 
-async fn ann<T>(
-    partition: &Partition,
+async fn ann<T, DB>(
+    backend: DB,
+    partition: &Partition<DB>,
     table: &RwLock<T>,
     params: &DiskannParams,
     embedding: Vector,
@@ -455,8 +492,9 @@ async fn ann<T>(
 ) -> AnnR
 where
     T: TableSearch + Send + Sync + 'static,
+    DB: DiskannBackend,
 {
-    let matches = search(partition, params, &embedding, limit.0.get())
+    let matches = search(backend, partition, params, &embedding, limit.0.get())
         .await
         .context("ann search failed")?;
 
@@ -666,7 +704,11 @@ mod tests {
             .map(|i| Vector::from(vec![i as f32, i as f32]))
             .collect();
 
-        let index = create_diskann_index(&params, Some(embeddings[0].as_slice())).unwrap();
+        let backend = inmem::InmemBackend::new();
+
+        let index = backend
+            .create_index(&params, embeddings[0].as_slice())
+            .unwrap();
         let partition = Partition {
             partition_id: PartitionId::from(0u64),
             index,
@@ -675,7 +717,14 @@ mod tests {
 
         // Try to insert more vectors than the cap allows.
         for (i, embedding) in embeddings.into_iter().enumerate() {
-            add_vector(&partition, &size, PrimaryId::from(i as u64), embedding).await;
+            add_vector(
+                backend.clone(),
+                &partition,
+                &size,
+                PrimaryId::from(i as u64),
+                embedding,
+            )
+            .await;
         }
 
         assert_eq!(size.load(Ordering::Relaxed), max_points.get());
