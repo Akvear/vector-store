@@ -51,9 +51,16 @@ vector_store=127.0.0.1:6080
 use_diskann=false
 [[ $engine == diskann ]] && use_diskann=true
 
+# vector-store runs inside a named systemd scope so the kernel accounts its
+# memory for us: memory.current is the live footprint, memory.peak a
+# high-water mark that needs no sampling.
+vs_scope=benchmark-50k-vs-$$
+vs_cgroup=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$vs_scope.scope
+
 vector_store_pid=
 teardown() {
     [[ -n $vector_store_pid ]] && kill $vector_store_pid 2> /dev/null || true
+    systemctl --user stop $vs_scope.scope > /dev/null 2>&1 || true
     docker rm -f benchmark-50k-scylla > /dev/null 2>&1 || true
 }
 trap teardown EXIT
@@ -63,8 +70,28 @@ run() {
     "$@" 2>&1 | tee -a $results
 }
 
+# Resident memory of the vector-store process tree, in MiB. The baseline is
+# taken before the index exists, so the delta is what the index costs.
+mem_mib() {
+    local bytes
+    bytes=$(cat $vs_cgroup/$1 2> /dev/null) || { echo "n/a"; return; }
+    echo $((bytes / 1024 / 1024))
+}
+
+log_memory() {
+    local current peak
+    current=$(mem_mib memory.current)
+    peak=$(mem_mib memory.peak)
+    if [[ -n $mem_baseline && $current != "n/a" ]]; then
+        echo "### memory ($1): current=${current}MiB peak=${peak}MiB delta_vs_baseline=$((current - mem_baseline))MiB" | tee -a $results
+    else
+        echo "### memory ($1): current=${current}MiB peak=${peak}MiB" | tee -a $results
+    fi
+}
+
 echo "### engine: $engine" | tee $results
 echo "### options: $options" | tee -a $results
+echo "### diskann_max_points: ${VECTOR_STORE_DISKANN_MAX_POINTS:-1000000}" | tee -a $results
 
 echo "Starting scylla ($scylla_image)"
 docker run --rm -d --name benchmark-50k-scylla --network host $scylla_image \
@@ -73,18 +100,28 @@ docker run --rm -d --name benchmark-50k-scylla --network host $scylla_image \
     --vector-store-primary-uri http://$vector_store > /dev/null
 timeout 180 bash -c 'until docker exec benchmark-50k-scylla cqlsh 127.0.0.1 -e "SELECT now() FROM system.local" > /dev/null 2>&1; do sleep 2; done'
 
-echo "Starting vector-store (VECTOR_STORE_USE_DISKANN=$use_diskann)"
-VECTOR_STORE_URI=$vector_store \
-VECTOR_STORE_SCYLLADB_URI=$scylla \
-VECTOR_STORE_USE_DISKANN=$use_diskann \
+echo "Starting vector-store (VECTOR_STORE_USE_DISKANN=$use_diskann, VECTOR_STORE_DISKANN_SCYLLA_BACKEND=${VECTOR_STORE_DISKANN_SCYLLA_BACKEND:-false})"
+systemd-run --user --scope --unit=$vs_scope -q -p MemoryAccounting=yes \
+    env MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-} \
+        VECTOR_STORE_URI=$vector_store \
+        VECTOR_STORE_SCYLLADB_URI=$scylla \
+        VECTOR_STORE_USE_DISKANN=$use_diskann \
+        VECTOR_STORE_DISKANN_SCYLLA_BACKEND=${VECTOR_STORE_DISKANN_SCYLLA_BACKEND:-false} \
+        VECTOR_STORE_DISKANN_MAX_POINTS=${VECTOR_STORE_DISKANN_MAX_POINTS:-1000000} \
     $vector_store_bin > ${results%.log}-vector-store.log 2>&1 &
 vector_store_pid=$!
 timeout 60 bash -c "until curl -sf http://$vector_store/api/v1/info > /dev/null; do sleep 1; done"
 run curl -sf http://$vector_store/api/v1/info
 echo | tee -a $results
 
+# Process floor: the index does not exist yet.
+mem_baseline=$(mem_mib memory.current)
+log_memory "baseline, no index"
+
 run $vsb build-table --data-dir $data_dir --scylla $scylla --rf 1 --concurrency 512
+log_memory "after table load"
 run $vsb build-index --scylla $scylla --vector-store $vector_store --options "$options"
+log_memory "after index build"
 
 # Serial recall passes - the correctness-gate numbers
 run $vsb search-cql --data-dir $data_dir --scylla $scylla --limit 10 --concurrency 1 --duration ${SERIAL_DURATION:-60s}
@@ -99,6 +136,8 @@ done
 for c in ${HTTP_RAMP:-1 8 32 128}; do
     run $vsb search-http --data-dir $data_dir --vector-store $vector_store --limit 10 --concurrency $c --duration ${RAMP_DURATION:-30s}
 done
+
+log_memory "after search phases"
 
 run $vsb drop-index --scylla $scylla
 run $vsb drop-table --scylla $scylla

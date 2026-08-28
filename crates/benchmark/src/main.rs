@@ -536,14 +536,15 @@ fn random(data: &[Query]) -> &Query {
     &data[rand::random_range(0..data.len())]
 }
 
-const BUCKETS: usize = 10_000;
-const MIN_DURATION: Duration = Duration::from_millis(1);
-const MAX_DURATION: Duration = Duration::from_millis(100);
-const STEP_DURATION: Duration = MAX_DURATION
-    .checked_sub(MIN_DURATION)
-    .unwrap()
-    .checked_div(BUCKETS as u32)
-    .unwrap();
+/// Latency histogram resolution: buckets are spaced logarithmically, so the
+/// relative error stays constant (~1.2%) over the whole range instead of the
+/// range being capped. A linear 1-100ms scale used to lump everything slower
+/// than 100ms into a single overflow bucket, which made percentiles useless
+/// for backends serving in the hundreds of milliseconds.
+const BUCKETS_PER_DECADE: usize = 200;
+const DECADES: u32 = 8;
+const BUCKETS: usize = BUCKETS_PER_DECADE * DECADES as usize;
+const MIN_DURATION: Duration = Duration::from_micros(1);
 
 #[derive(Clone)]
 struct Histogram {
@@ -559,23 +560,40 @@ impl Histogram {
         }
     }
 
+    /// Bucket index for a latency: 0 for anything below [`MIN_DURATION`],
+    /// `1..=BUCKETS` for the logarithmic range, `BUCKETS + 1` for overflow.
+    fn bucket_index(value: Duration) -> usize {
+        if value <= MIN_DURATION {
+            return 0;
+        }
+        let decades = value.div_duration_f64(MIN_DURATION).log10();
+        let idx = (decades * BUCKETS_PER_DECADE as f64) as usize + 1;
+        idx.min(BUCKETS + 1)
+    }
+
+    /// Lower edge of a bucket produced by [`Self::bucket_index`].
+    fn bucket_value(idx: usize) -> Duration {
+        if idx == 0 {
+            return Duration::ZERO;
+        }
+        if idx > BUCKETS {
+            return Duration::MAX;
+        }
+        MIN_DURATION.mul_f64(10f64.powf((idx - 1) as f64 / BUCKETS_PER_DECADE as f64))
+    }
+
     fn record(&mut self, value: Duration) {
-        let idx = if value < MIN_DURATION {
-            0
-        } else if value > MAX_DURATION {
-            BUCKETS + 1
-        } else {
-            (value - MIN_DURATION)
-                .div_duration_f64(STEP_DURATION)
-                .round() as usize
-                + 1
-        };
-        self.buckets[idx] += 1;
+        self.buckets[Self::bucket_index(value)] += 1;
         self.count += 1;
     }
 
     fn percentile(&self, percentile: f64) -> Duration {
-        let percentile = (self.count as f64 * percentile / 100.0) as u64;
+        if self.count == 0 {
+            return Duration::ZERO;
+        }
+        // At least one sample must be covered: rounding the target down to
+        // zero would otherwise always select the first bucket.
+        let target = ((self.count as f64 * percentile / 100.0).ceil() as u64).max(1);
         let mut sum = 0;
         let Some(idx) = self
             .buckets
@@ -585,14 +603,11 @@ impl Histogram {
                 sum += count;
                 (idx, sum)
             })
-            .find_map(|(idx, sum)| (sum >= percentile).then_some(idx))
+            .find_map(|(idx, sum)| (sum >= target).then_some(idx))
         else {
             return Duration::MAX;
         };
-        if idx == self.buckets.len() - 1 {
-            return Duration::MAX;
-        }
-        MIN_DURATION + STEP_DURATION * idx as u32
+        Self::bucket_value(idx)
     }
 
     fn append(&mut self, other: &Self) {
@@ -694,5 +709,71 @@ impl SearchMeasure {
             );
             info!("recall max{label}: {:.1}", self.recall_max * 100.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Percentiles are accurate to within one logarithmic bucket.
+    fn assert_close(actual: Duration, expected: Duration) {
+        let ratio = actual.div_duration_f64(expected);
+        let tolerance = 10f64.powf(1.0 / BUCKETS_PER_DECADE as f64);
+        assert!(
+            ratio > 1.0 / tolerance && ratio < tolerance,
+            "{actual:?} not within one bucket of {expected:?}"
+        );
+    }
+
+    #[test]
+    fn percentiles_span_microseconds_to_seconds() {
+        // Latencies far above the old 100ms cap must be reported, not saturated.
+        for value in [
+            Duration::from_micros(5),
+            Duration::from_millis(1),
+            Duration::from_millis(250),
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        ] {
+            let mut histogram = Histogram::new();
+            histogram.record(value);
+            assert_close(histogram.percentile(50.0), value);
+        }
+    }
+
+    #[test]
+    fn percentiles_split_a_mixed_distribution() {
+        let mut histogram = Histogram::new();
+        for _ in 0..90 {
+            histogram.record(Duration::from_millis(5));
+        }
+        for _ in 0..10 {
+            histogram.record(Duration::from_millis(800));
+        }
+        assert_close(histogram.percentile(50.0), Duration::from_millis(5));
+        assert_close(histogram.percentile(99.0), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn out_of_range_latencies_saturate() {
+        let mut histogram = Histogram::new();
+        histogram.record(Duration::from_nanos(10));
+        assert_eq!(histogram.percentile(50.0), Duration::ZERO);
+
+        let mut histogram = Histogram::new();
+        histogram.record(Duration::from_secs(1_000));
+        assert_eq!(histogram.percentile(50.0), Duration::MAX);
+    }
+
+    #[test]
+    fn append_merges_counts() {
+        let mut a = Histogram::new();
+        a.record(Duration::from_millis(10));
+        let mut b = Histogram::new();
+        b.record(Duration::from_millis(10));
+        a.append(&b);
+        assert_eq!(a.count, 2);
+        assert_close(a.percentile(50.0), Duration::from_millis(10));
     }
 }
