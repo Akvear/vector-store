@@ -48,8 +48,10 @@ scylla_image=${SCYLLA_IMAGE:-scylladb/scylla:2026.2.2}
 scylla=127.0.0.1:9042
 vector_store=127.0.0.1:6080
 
-use_diskann=false
-[[ $engine == diskann ]] && use_diskann=true
+# VECTOR_STORE_DISKANN_BACKEND selects the DiskANN backend (inmem/scylla);
+# leaving it unset runs the usearch engine.
+diskann_backend=
+[[ $engine == diskann ]] && diskann_backend=${VECTOR_STORE_DISKANN_BACKEND:-inmem}
 
 # vector-store runs inside a named systemd scope so the kernel accounts its
 # memory for us: memory.current is the live footprint, memory.peak a
@@ -100,14 +102,17 @@ docker run --rm -d --name benchmark-50k-scylla --network host $scylla_image \
     --vector-store-primary-uri http://$vector_store > /dev/null
 timeout 180 bash -c 'until docker exec benchmark-50k-scylla cqlsh 127.0.0.1 -e "SELECT now() FROM system.local" > /dev/null 2>&1; do sleep 2; done'
 
-echo "Starting vector-store (VECTOR_STORE_USE_DISKANN=$use_diskann, VECTOR_STORE_DISKANN_SCYLLA_BACKEND=${VECTOR_STORE_DISKANN_SCYLLA_BACKEND:-false})"
+vs_env=(
+    VECTOR_STORE_URI=$vector_store
+    VECTOR_STORE_SCYLLADB_URI=$scylla
+    VECTOR_STORE_DISKANN_MAX_POINTS=${VECTOR_STORE_DISKANN_MAX_POINTS:-1000000}
+)
+[[ -n $diskann_backend ]] && vs_env+=(VECTOR_STORE_DISKANN_BACKEND=$diskann_backend)
+[[ -n ${MALLOC_ARENA_MAX:-} ]] && vs_env+=(MALLOC_ARENA_MAX=$MALLOC_ARENA_MAX)
+
+echo "Starting vector-store (VECTOR_STORE_DISKANN_BACKEND=${diskann_backend:-<unset, usearch>})"
 systemd-run --user --scope --unit=$vs_scope -q -p MemoryAccounting=yes \
-    env MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-} \
-        VECTOR_STORE_URI=$vector_store \
-        VECTOR_STORE_SCYLLADB_URI=$scylla \
-        VECTOR_STORE_USE_DISKANN=$use_diskann \
-        VECTOR_STORE_DISKANN_SCYLLA_BACKEND=${VECTOR_STORE_DISKANN_SCYLLA_BACKEND:-false} \
-        VECTOR_STORE_DISKANN_MAX_POINTS=${VECTOR_STORE_DISKANN_MAX_POINTS:-1000000} \
+    env "${vs_env[@]}" \
     $vector_store_bin > ${results%.log}-vector-store.log 2>&1 &
 vector_store_pid=$!
 timeout 60 bash -c "until curl -sf http://$vector_store/api/v1/info > /dev/null; do sleep 1; done"
