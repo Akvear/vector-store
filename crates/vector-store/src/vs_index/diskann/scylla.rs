@@ -27,7 +27,9 @@
 //!
 //! # What lives in RAM
 //!
-//! * The graph: one [`Node`] per vector, holding its adjacency list.
+//! * Node liveness: one [`Liveness`] per vector. Adjacency lists sit behind a
+//!   [`GraphStore`], so they are in RAM only for as long as that is an
+//!   [`InmemGraphStore`].
 //! * Start points, vectors included. Their ids are [`PrimaryId::RESERVED`], not
 //!   backed by a row, so they can never be read back from ScyllaDB.
 //! * Vectors of in-flight inserts. Back-edge pruning asks for the new vector
@@ -203,14 +205,16 @@ pub(super) struct ScyllaBackend {
     strategy: ScyllaStrategy,
     context: DefaultContext,
     source: Arc<dyn VectorSource>,
+    graph: Arc<dyn GraphStore>,
 }
 
 impl ScyllaBackend {
-    pub(super) fn new(source: Arc<dyn VectorSource>) -> Self {
+    pub(super) fn new(source: Arc<dyn VectorSource>, graph: Arc<dyn GraphStore>) -> Self {
         Self {
             strategy: ScyllaStrategy::default(),
             context: DefaultContext,
             source,
+            graph,
         }
     }
 }
@@ -232,6 +236,7 @@ impl DiskannBackend for ScyllaBackend {
             params.config.max_degree().get(),
             partition_id,
             Arc::clone(&self.source),
+            Arc::clone(&self.graph),
         )
         .context("failed to create ScyllaProvider")?;
 
@@ -247,48 +252,141 @@ impl DiskannBackend for ScyllaBackend {
     }
 }
 
-#[derive(Debug)]
-enum Node {
-    Live(AdjacencyList<PrimaryId>),
-    Dead(AdjacencyList<PrimaryId>),
+/// Whether the graph still treats a node as reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    Live,
+    Dead,
 }
 
-impl Node {
-    fn new(capacity: usize) -> Self {
-        Self::Live(AdjacencyList::with_capacity(capacity))
+impl Liveness {
+    fn is_live(self) -> bool {
+        self == Self::Live
     }
+}
 
-    fn is_live(&self) -> bool {
-        matches!(self, Self::Live(_))
-    }
+/// Where a [`ScyllaProvider`] keeps its adjacency lists.
+///
+/// A store may hold edges for an id `nodes` no longer knows: reaping a row is
+/// best effort, not a guarantee. Nothing reads those, since `nodes` is what
+/// says a node exists, and `set_element` clears the row before an id can be
+/// used again.
+#[async_trait]
+pub(super) trait GraphStore: Debug + Send + Sync + 'static {
+    /// Read one node's adjacency list into `edges`, replacing whatever it held;
+    /// an id with no stored list leaves `edges` empty.
+    ///
+    /// What lands in `edges` has to be duplicate-free: it goes straight into the
+    /// graph search.
+    async fn get(
+        &self,
+        partition_id: PartitionId,
+        id: PrimaryId,
+        edges: &mut AdjacencyList<PrimaryId>,
+    ) -> anyhow::Result<()>;
 
-    fn neighbors(&self) -> &AdjacencyList<PrimaryId> {
-        let (Self::Live(neighbors) | Self::Dead(neighbors)) = self;
-        neighbors
-    }
+    /// Replace one node's adjacency list with `edges`, deduplicated and then
+    /// capped at the store's max degree.
+    async fn set(
+        &self,
+        partition_id: PartitionId,
+        id: PrimaryId,
+        edges: &[PrimaryId],
+    ) -> anyhow::Result<()>;
 
-    fn neighbors_mut(&mut self) -> &mut AdjacencyList<PrimaryId> {
-        let (Self::Live(neighbors) | Self::Dead(neighbors)) = self;
-        neighbors
-    }
+    /// Append `edges` to one node's adjacency list, deduplicated, then cap it at
+    /// the store's max degree.
+    async fn append(
+        &self,
+        partition_id: PartitionId,
+        id: PrimaryId,
+        edges: &[PrimaryId],
+    ) -> anyhow::Result<()>;
 
-    fn mark_deleted(&mut self) {
-        if let Self::Live(neighbors) = self {
-            *self = Self::Dead(std::mem::take(neighbors));
+    /// Drop one node's adjacency list.
+    async fn remove(&self, partition_id: PartitionId, id: PrimaryId) -> anyhow::Result<()>;
+}
+
+/// A [`GraphStore`] holding adjacency lists in RAM.
+#[derive(Debug)]
+pub(super) struct InmemGraphStore {
+    edges: RwLock<BTreeMap<PrimaryId, AdjacencyList<PrimaryId>>>,
+    max_degree: usize,
+}
+
+impl InmemGraphStore {
+    pub(super) fn new(max_degree: usize) -> Self {
+        Self {
+            edges: RwLock::default(),
+            max_degree,
         }
+    }
+}
+
+#[async_trait]
+impl GraphStore for InmemGraphStore {
+    async fn get(
+        &self,
+        _partition_id: PartitionId,
+        id: PrimaryId,
+        edges: &mut AdjacencyList<PrimaryId>,
+    ) -> anyhow::Result<()> {
+        edges.clear();
+        if let Some(list) = self.edges.read().unwrap().get(&id) {
+            edges.overwrite_trusted(list);
+        }
+        Ok(())
+    }
+
+    async fn set(
+        &self,
+        _partition_id: PartitionId,
+        id: PrimaryId,
+        edges: &[PrimaryId],
+    ) -> anyhow::Result<()> {
+        let mut lists = self.edges.write().unwrap();
+        let list = lists.entry(id).or_default();
+        // `extend_from_slice` deduplicates through `push`, which is what keeps
+        // the stored list unique.
+        list.clear();
+        list.extend_from_slice(edges);
+        list.truncate(self.max_degree);
+        Ok(())
+    }
+
+    async fn append(
+        &self,
+        _partition_id: PartitionId,
+        id: PrimaryId,
+        edges: &[PrimaryId],
+    ) -> anyhow::Result<()> {
+        // One lock over the read and the write, so concurrent appends to the
+        // same node cannot lose each other.
+        let mut lists = self.edges.write().unwrap();
+        let list = lists.entry(id).or_default();
+        list.extend_from_slice(edges);
+        list.truncate(self.max_degree);
+        Ok(())
+    }
+
+    async fn remove(&self, _partition_id: PartitionId, id: PrimaryId) -> anyhow::Result<()> {
+        self.edges.write().unwrap().remove(&id);
+        Ok(())
     }
 }
 
 /// Vectors held in RAM only for the duration of an insert.
 type Inflight = Arc<RwLock<BTreeMap<PrimaryId, Vector>>>;
 
-/// The graph, keyed by internal id.
-type Nodes = Arc<RwLock<BTreeMap<PrimaryId, Node>>>;
+/// Node presence and liveness, keyed by internal id. The edges live in a
+/// [`GraphStore`].
+type Nodes = Arc<RwLock<BTreeMap<PrimaryId, Liveness>>>;
 
 /// A DiskANN provider whose vector reads go to a [`VectorSource`].
 #[derive(Debug)]
 pub(super) struct ScyllaProvider {
     nodes: Nodes,
+    graph: Arc<dyn GraphStore>,
     inflight: Inflight,
     start: Vector,
     start_neighbors: RwLock<AdjacencyList<PrimaryId>>,
@@ -307,6 +405,7 @@ impl ScyllaProvider {
         max_degree: usize,
         partition_id: PartitionId,
         source: Arc<dyn VectorSource>,
+        graph: Arc<dyn GraphStore>,
     ) -> anyhow::Result<Self> {
         if start_point.len() != dim {
             bail!(
@@ -317,6 +416,7 @@ impl ScyllaProvider {
 
         Ok(Self {
             nodes: Nodes::default(),
+            graph,
             inflight: Inflight::default(),
             start: Vector::from(start_point.to_vec()),
             start_neighbors: RwLock::new(AdjacencyList::with_capacity(max_degree)),
@@ -407,13 +507,15 @@ impl ScyllaProvider {
             .read()
             .unwrap()
             .get(&id)
-            .is_some_and(|node| node.is_live())
+            .is_some_and(|liveness| liveness.is_live())
     }
 
     fn adjacency(&self) -> NodeAccessor<'_> {
         NodeAccessor {
             nodes: &self.nodes,
+            graph: self.graph.as_ref(),
             start_neighbors: &self.start_neighbors,
+            partition_id: self.partition_id,
             max_degree: self.max_degree,
         }
     }
@@ -473,18 +575,30 @@ impl SetElement<&[f32]> for ScyllaProvider {
             )));
         }
 
+        if self.is_live(internal) {
+            return Err(ANNError::message("id already exists"));
+        }
+
+        // A fresh node starts with no edges, so drop whatever a tombstone or a
+        // rolled-back insert left behind.
+        self.graph
+            .remove(self.partition_id, internal)
+            .await
+            .map_err(|err| {
+                ANNError::message(format!(
+                    "failed to clear the graph row for {internal}: {err:#}"
+                ))
+            })?;
+
         match self.nodes.write().unwrap().entry(internal) {
             Entry::Occupied(mut occupied) => {
-                if occupied.get().is_live() {
-                    return Err(ANNError::message("id already exists"));
-                }
                 // A tombstone the graph has not finished reaping. Only reachable
                 // once this id has been re-issued, which needs the `PrimaryId`
                 // epoch to have wrapped, so treat it as a fresh node.
-                *occupied.get_mut() = Node::new(self.max_degree);
+                *occupied.get_mut() = Liveness::Live;
             }
             Entry::Vacant(vacant) => {
-                vacant.insert(Node::new(self.max_degree));
+                vacant.insert(Liveness::Live);
             }
         }
 
@@ -520,8 +634,8 @@ impl Delete for ScyllaProvider {
         let id = *gid;
 
         let result = match self.nodes.write().unwrap().get_mut(&id) {
-            Some(node) if node.is_live() => {
-                node.mark_deleted();
+            Some(liveness) if liveness.is_live() => {
+                *liveness = Liveness::Dead;
                 Ok(())
             }
             _ => Err(ANNError::message("id already deleted")),
@@ -574,7 +688,9 @@ struct InflightState {
 }
 
 /// Cleans up after an insert: the in-flight vector copy always, and the node
-/// `set_element` created unless the insert completed.
+/// `set_element` created unless the insert completed. Any edges it had already
+/// written are left to the store, which cannot be told to drop them from a
+/// synchronous `Drop`.
 pub(super) struct InflightGuard(Option<InflightState>);
 
 impl provider::Guard for InflightGuard {
@@ -601,8 +717,10 @@ impl Drop for InflightGuard {
 
 /// Read/write access to the graph's adjacency lists.
 pub(super) struct NodeAccessor<'a> {
-    nodes: &'a RwLock<BTreeMap<PrimaryId, Node>>,
+    nodes: &'a RwLock<BTreeMap<PrimaryId, Liveness>>,
+    graph: &'a dyn GraphStore,
     start_neighbors: &'a RwLock<AdjacencyList<PrimaryId>>,
+    partition_id: PartitionId,
     max_degree: usize,
 }
 
@@ -613,6 +731,14 @@ impl NodeAccessor<'_> {
         list.extend_from_slice(neighbors);
         list.truncate(max_degree);
     }
+
+    /// Whether the graph has an entry for `id` at all, live or tombstoned.
+    ///
+    /// A write to an absent node is dropped rather than being an error: a
+    /// delete racing an insert may have reaped it already.
+    fn is_present(&self, id: PrimaryId) -> bool {
+        self.nodes.read().unwrap().contains_key(&id)
+    }
 }
 
 impl HasId for NodeAccessor<'_> {
@@ -620,74 +746,92 @@ impl HasId for NodeAccessor<'_> {
 }
 
 impl NeighborAccessor for NodeAccessor<'_> {
-    fn get_neighbors(
+    async fn get_neighbors(
         &mut self,
         id: Self::Id,
         neighbors: &mut AdjacencyList<Self::Id>,
-    ) -> impl Future<Output = ANNResult<()>> + Send {
+    ) -> ANNResult<()> {
         neighbors.clear();
         if id == START_ID {
             neighbors.overwrite_trusted(&self.start_neighbors.read().unwrap());
-        } else if let Some(node) = self.nodes.read().unwrap().get(&id) {
-            neighbors.overwrite_trusted(node.neighbors());
+            return Ok(());
         }
-        std::future::ready(Ok(()))
+
+        // An id `nodes` has never heard of has no edges, whatever the store
+        // still holds for it: a stale in-edge to a reaped node must not
+        // resurrect the list that node left behind.
+        if !self.is_present(id) {
+            return Ok(());
+        }
+
+        self.graph
+            .get(self.partition_id, id, neighbors)
+            .await
+            .map_err(|err| ANNError::message(format!("graph store failed: {err:#}")))
     }
 }
 
 impl NeighborAccessorMut for NodeAccessor<'_> {
-    fn set_neighbors(
-        &mut self,
-        id: Self::Id,
-        neighbors: &[Self::Id],
-    ) -> impl Future<Output = ANNResult<()>> + Send {
+    async fn set_neighbors(&mut self, id: Self::Id, neighbors: &[Self::Id]) -> ANNResult<()> {
         if id == START_ID {
             Self::overwrite(
                 &mut self.start_neighbors.write().unwrap(),
                 neighbors,
                 self.max_degree,
             );
-            return std::future::ready(Ok(()));
+            return Ok(());
         }
 
-        let mut nodes = self.nodes.write().unwrap();
-        if let Entry::Occupied(mut occupied) = nodes.entry(id) {
-            if neighbors.is_empty() && !occupied.get().is_live() {
-                // `drop_adj_list` at the end of an in-place delete. This is
-                // the only place a completed delete removes its node; one that
-                // never gets here is a tombstone, and nothing else clears it.
-                occupied.remove();
-            } else {
-                Self::overwrite(
-                    occupied.get_mut().neighbors_mut(),
-                    neighbors,
-                    self.max_degree,
-                );
+        // Payload write has to await, so it cannot hold the guard.
+        let reap = {
+            let mut nodes = self.nodes.write().unwrap();
+            match nodes.entry(id) {
+                // `drop_adj_list` at the end of an in-place delete. This is the
+                // only place a completed delete removes its node; one that never
+                // gets here is a tombstone, and nothing else clears it.
+                Entry::Occupied(occupied) if neighbors.is_empty() && !occupied.get().is_live() => {
+                    occupied.remove();
+                    true
+                }
+                Entry::Occupied(_) => false,
+                // A missing node is not an error: a delete racing this insert
+                // may have reaped it already. Dropping the write leaves
+                // in-edges pointing at an absent id, which `load` skips
+                // without a ScyllaDB read.
+                Entry::Vacant(_) => return Ok(()),
             }
+        };
+
+        if reap {
+            return self
+                .graph
+                .remove(self.partition_id, id)
+                .await
+                .map_err(|err| ANNError::message(format!("graph store failed: {err:#}")));
         }
 
-        // A missing node is not an error: a delete racing this insert may have
-        // reaped it already. Dropping the write leaves in-edges pointing at an
-        // absent id, which `load` skips without a ScyllaDB read.
-        std::future::ready(Ok(()))
+        self.graph
+            .set(self.partition_id, id, neighbors)
+            .await
+            .map_err(|err| ANNError::message(format!("graph store failed: {err:#}")))
     }
 
-    fn append_vector(
-        &mut self,
-        id: Self::Id,
-        neighbors: &[Self::Id],
-    ) -> impl Future<Output = ANNResult<()>> + Send {
+    async fn append_vector(&mut self, id: Self::Id, neighbors: &[Self::Id]) -> ANNResult<()> {
         if id == START_ID {
             let mut start = self.start_neighbors.write().unwrap();
             start.extend_from_slice(neighbors);
             start.truncate(self.max_degree);
-        } else if let Some(node) = self.nodes.write().unwrap().get_mut(&id) {
-            let list = node.neighbors_mut();
-            list.extend_from_slice(neighbors);
-            list.truncate(self.max_degree);
+            return Ok(());
         }
 
-        std::future::ready(Ok(()))
+        if !self.is_present(id) {
+            return Ok(());
+        }
+
+        self.graph
+            .append(self.partition_id, id, neighbors)
+            .await
+            .map_err(|err| ANNError::message(format!("graph store failed: {err:#}")))
     }
 }
 
