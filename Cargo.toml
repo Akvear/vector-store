@@ -102,6 +102,8 @@ secrecy = "0.10.3"
 [patch.crates-io]
 # Currently, axum-server-dual-protocol doesn't have a published version that supports axum 0.8, so we need to use the git version from the PR.
 axum-server-dual-protocol = { git = "https://github.com/vinchona/axum-server-dual-protocol", rev = "ca6db055254255b74238673ce4135698e347d71c" }
+# TEMPORARY: test scylladb/scylla-rust-driver#1924 (collections deserialization).
+scylla = { git = "https://github.com/Lorak-mmk/scylla-rust-driver", rev = "2ed71f9a30073f53ea3c3c92e4b6ff9a408f29c7" }
 
 [profile.dev]
 opt-level = 1
