@@ -139,6 +139,17 @@ pub(super) trait VectorSource: Debug + Send + Sync + 'static {
         partition_id: PartitionId,
         ids: &[PrimaryId],
     ) -> anyhow::Result<Vec<Option<Vector>>>;
+
+    /// Hand the source the vector it will later be asked for. A source whose
+    /// data lives elsewhere, like the base table, has nothing to do.
+    async fn put(
+        &self,
+        _partition_id: PartitionId,
+        _id: PrimaryId,
+        _vector: &[f32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A [`VectorSource`] reading vectors back from the index's base table.
@@ -949,6 +960,15 @@ impl SetElement<&[f32]> for ScyllaProvider {
                     "failed to create the graph node for {internal}: {err:#}"
                 )),
             })?;
+
+        // The node exists from here, so a source that cannot take the vector
+        // has to take the node back with it.
+        if let Err(err) = self.source.put(self.partition_id, internal, element).await {
+            self.graph.abandon(self.partition_id, internal);
+            return Err(ANNError::message(format!(
+                "failed to store the vector for {internal}: {err:#}"
+            )));
+        }
 
         // Back-edge pruning asks `fill` for this vector before the insert is
         // done. The row is already in ScyllaDB, since that is where it came
