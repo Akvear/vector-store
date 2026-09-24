@@ -6,6 +6,7 @@
 use crate::Config;
 use crate::Credentials;
 use crate::DiskannAlpha;
+use crate::DiskannBackendKind;
 use crate::file_monitor::TlsFilesMonitor;
 use crate::tls;
 use crate::tls::TlsServerConfig;
@@ -222,6 +223,14 @@ impl ConfigManager {
             changes.push(format!(
                 "Thread count: {:?} -> {:?}",
                 old_config.threads, new_config.threads
+            ));
+        }
+
+        // Check diskann_data_dir
+        if old_config.diskann_data_dir != new_config.diskann_data_dir {
+            changes.push(format!(
+                "DiskANN data directory: {:?} -> {:?}",
+                old_config.diskann_data_dir, new_config.diskann_data_dir
             ));
         }
 
@@ -461,8 +470,18 @@ pub async fn load_config(env: impl Fn(&str) -> anyhow::Result<String>) -> anyhow
 
     if let Ok(diskann_backend) = env("VECTOR_STORE_DISKANN_BACKEND") {
         config.diskann_backend = Some(diskann_backend.trim().parse().map_err(|_| {
-            anyhow!("Unable to parse VECTOR_STORE_DISKANN_BACKEND env (inmem/scylla)")
+            anyhow!(
+                "Unable to parse VECTOR_STORE_DISKANN_BACKEND env (inmem/scylla/scylla-graph/disk)"
+            )
         })?);
+    }
+
+    config.diskann_data_dir = env("VECTOR_STORE_DISKANN_DATA_DIR")
+        .ok()
+        .map(|dir| std::path::PathBuf::from(dir.trim()));
+    if config.diskann_backend == Some(DiskannBackendKind::Disk) && config.diskann_data_dir.is_none()
+    {
+        bail!("VECTOR_STORE_DISKANN_BACKEND=disk requires VECTOR_STORE_DISKANN_DATA_DIR");
     }
 
     config.alter_index_simulator = env("VECTOR_STORE_ALTER_INDEX_SIMULATOR")
@@ -978,6 +997,28 @@ mod tests {
             Some(NonZeroUsize::new(500_000).unwrap())
         );
         assert_eq!(config.diskann_backend, Some(DiskannBackendKind::Scylla));
+        assert_eq!(config.diskann_data_dir, None);
+    }
+
+    #[tokio::test]
+    async fn load_config_diskann_disk_needs_a_data_dir() {
+        let env = mock_env(HashMap::from([(
+            "VECTOR_STORE_DISKANN_BACKEND",
+            "disk".into(),
+        )]));
+        let err = load_config(env).await.unwrap_err().to_string();
+        assert!(err.contains("VECTOR_STORE_DISKANN_DATA_DIR"), "{err}");
+
+        let env = mock_env(HashMap::from([
+            ("VECTOR_STORE_DISKANN_BACKEND", "disk".into()),
+            ("VECTOR_STORE_DISKANN_DATA_DIR", "/var/lib/vs".into()),
+        ]));
+        let config = load_config(env).await.unwrap();
+        assert_eq!(config.diskann_backend, Some(DiskannBackendKind::Disk));
+        assert_eq!(
+            config.diskann_data_dir,
+            Some(std::path::PathBuf::from("/var/lib/vs"))
+        );
     }
 
     #[tokio::test]
